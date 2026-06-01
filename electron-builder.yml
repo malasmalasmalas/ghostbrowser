@@ -1,0 +1,56 @@
+appId: com.multibrowser.app
+productName: MultiBrowser
+asar: true
+asarUnpack:
+  - node_modules/puppeteer-core/**/*
+  - node_modules/chromium-bidi/**/*
+  - node_modules/devtools-protocol/**/*
+  - node_modules/ws/**/*
+  - node_modules/mitt/**/*
+  - node_modules/debug/**/*
+  - node_modules/ms/**/*
+  - node_modules/uuid/**/*
+directories:
+  output: dist
+  buildResources: buildResources
+files:
+  - out/**/*
+  - node_modules/puppeteer-core/**/*
+  - node_modules/chromium-bidi/**/*
+  - node_modules/devtools-protocol/**/*
+  - node_modules/ws/**/*
+  - node_modules/mitt/**/*
+  - node_modules/debug/**/*
+  - node_modules/ms/**/*
+  - node_modules/uuid/**/*
+  - node_modules/@fortawesome/**/*
+extraResources:
+  - from: resources/chrome-win64/
+    to: chrome-win64/
+    filter:
+      - "**/*"
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  signAndEditExecutable: false
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: MultiBrowser
+electronLanguages:
+  - en-US
+  - en-GB
+linux:
+  target:
+    - target: AppImage
+      arch:
+        - x64
+    - target: deb
+      arch:
+        - x64
+  category: Network
+  icon: buildResources/icon.png
