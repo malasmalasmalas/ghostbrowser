@@ -54,8 +54,16 @@ interface ElectronAPI {
   updateExtension: (id: string, payload: Partial<Omit<ExtensionInfo, 'id'>>) => Promise<void>
   deleteExtension: (id: string) => Promise<void>
   getGlobalExtensions: () => Promise<ExtensionInfo[]>
+  // Chrome import
+  listChromeProfiles: () => Promise<{ name: string; path: string }[]>
+  importChromeCookies: (chromeProfilePath: string, domain?: string) => Promise<{ ok: boolean; message: string; cookies?: any[] }>
+  detectChromeExtensions: () => Promise<{ id: string; name: string; version: string; path: string; enabled: boolean; description: string }[]>
+  addExtensionFromPath: (extPath: string, name: string, enabled: boolean) => Promise<ExtensionInfo | null>
+  // Warmup
+  warmupProfile: (id: string, siteCount?: number) => Promise<void>
   // Events
   onProxyHealth: (cb: (results: { id: string; label: string; ok: boolean; latency?: number }[]) => void) => () => void
+  onResourceUpdate: (cb: (results: { id: string; cpu: number; memory: number }[]) => void) => () => void
 }
 
 declare global {
