@@ -1,23 +1,39 @@
 import path from 'path'
 import fs from 'fs'
+import { spawn, ChildProcess } from 'child_process'
 import { app, screen } from 'electron'
 import { Profile, Fingerprint } from '@shared/types'
 import { getGlobalExtensions, getAllExtensions, getProxyById, getProfileById, updateProfileRecord } from './db'
 
+const activeBrowsers = new Map<string, { process: ChildProcess; fingerprint: Fingerprint }>()
+const proxyRotationTimers = new Map<string, ReturnType<typeof setInterval>>()
+let masterProfileId: string | null = null
+let mirrorInterval: ReturnType<typeof setInterval> | null = null
+
+export function logToFile(msg: string): void {
+  try {
+    const logPath = path.join(app.getPath('userData'), 'debug.log')
+    fs.appendFileSync(logPath, `${new Date().toISOString()} ${msg}\n`)
+  } catch {}
+}
+
+logToFile('windowManager module loaded')
+
 function getStealthExtensionPath(): string {
-  const isPackaged = app.isPackaged
-  if (isPackaged) {
+  if (app.isPackaged) {
     return path.join(process.resourcesPath, 'stealth-extension')
   }
   return path.join(app.getAppPath(), 'src', 'main', 'stealth-extension')
 }
 
-function generateProfileStealthExtension(fp: Fingerprint, profileId: string): string {
+function generateProfileExtensions(fp: Fingerprint, profileId: string, proxy?: { type: string; host: string; port: number; username?: string; password?: string }): string {
   const extDir = path.join(app.getPath('userData'), 'stealth-ext', profileId)
   if (!fs.existsSync(extDir)) fs.mkdirSync(extDir, { recursive: true })
 
-  const manifest = {
-    manifest_version: 3,
+  const hasProxyAuth = proxy && proxy.username && proxy.password
+
+  const manifest: any = {
+    manifest_version: 2,
     name: 'Browser Helper',
     version: '1.0.0',
     description: 'Browser enhancement utility',
@@ -25,16 +41,26 @@ function generateProfileStealthExtension(fp: Fingerprint, profileId: string): st
       matches: ['<all_urls>'],
       js: ['stealth.js', 'fingerprint.js'],
       run_at: 'document_start',
-      all_frames: true,
-      world: 'MAIN'
+      all_frames: true
     }],
-    permissions: []
+    permissions: ['<all_urls>']
   }
+
+  if (hasProxyAuth) {
+    manifest.permissions.push('webRequest', 'webRequestBlocking')
+    manifest.background = { scripts: ['proxy-auth.js'], persistent: true }
+  }
+
   fs.writeFileSync(path.join(extDir, 'manifest.json'), JSON.stringify(manifest, null, 2))
 
   const baseStealth = path.join(getStealthExtensionPath(), 'stealth.js')
   if (fs.existsSync(baseStealth)) {
     fs.copyFileSync(baseStealth, path.join(extDir, 'stealth.js'))
+  }
+
+  if (hasProxyAuth) {
+    const proxyAuthScript = `chrome.webRequest.onAuthRequired.addListener(function(details){return{authCredentials:{username:${JSON.stringify(proxy!.username)},password:${JSON.stringify(proxy!.password)}}};},{urls:["<all_urls>"]},["blocking"]);`
+    fs.writeFileSync(path.join(extDir, 'proxy-auth.js'), proxyAuthScript)
   }
 
   const fpScript = `(function(){
@@ -54,6 +80,7 @@ function generateProfileStealthExtension(fp: Fingerprint, profileId: string): st
     Object.defineProperty(window, 'outerHeight', { get: () => ${fp.viewport.height + 80} });
     Object.defineProperty(window, 'devicePixelRatio', { get: () => ${fp.deviceScaleFactor} });
     Object.defineProperty(navigator, 'appVersion', { get: () => ${JSON.stringify(fp.userAgent.replace('Mozilla/', ''))} });
+    Object.defineProperty(navigator, 'userAgent', { get: () => ${JSON.stringify(fp.userAgent)} });
 
     // WebGL
     (function(){
@@ -177,24 +204,6 @@ function generateProfileStealthExtension(fp: Fingerprint, profileId: string): st
   return extDir
 }
 
-const activeBrowsers = new Map<string, { browser: any; fingerprint: Fingerprint }>()
-const proxyRotationTimers = new Map<string, ReturnType<typeof setInterval>>()
-let masterProfileId: string | null = null
-let mirrorInterval: ReturnType<typeof setInterval> | null = null
-
-export function logToFile(msg: string): void {
-  try {
-    const logPath = path.join(app.getPath('userData'), 'debug.log')
-    fs.appendFileSync(logPath, `${new Date().toISOString()} ${msg}\n`)
-  } catch {}
-}
-
-logToFile('windowManager module loaded')
-
-/**
- * Start proxy rotation timer for a profile.
- * On each tick: close browser, pick next proxy from pool, re-launch.
- */
 function startProxyRotation(profile: Profile): void {
   stopProxyRotation(profile.id)
   const intervalMs = (profile.proxyRotateInterval || 5) * 60 * 1000
@@ -213,14 +222,6 @@ function startProxyRotation(profile: Profile): void {
         return
       }
 
-      // Get current page URL to restore after rotation
-      let currentUrl = currentProfile.startUrl || 'https://www.google.com'
-      try {
-        const pages = await entry.browser.pages()
-        if (pages.length > 0) currentUrl = pages[0].url() || currentUrl
-      } catch {}
-
-      // Pick next proxy
       const idx = ((currentProfile.proxyPoolIndex || 0) + 1) % currentProfile.proxyPool.length
       const nextProxyRecord = getProxyById(currentProfile.proxyPool[idx])
       if (!nextProxyRecord) {
@@ -233,21 +234,14 @@ function startProxyRotation(profile: Profile): void {
 
       logToFile(`Proxy rotation for ${currentProfile.name}: switching to ${nextProxyRecord.label} (${nextProxyRecord.host}:${nextProxyRecord.port})`)
 
-      // Close current browser (this will trigger 'disconnected' and clear this timer)
-      // So we need to stop timer first, then close, then re-launch with new timer
       clearInterval(timer)
       proxyRotationTimers.delete(profile.id)
 
-      try {
-        await entry.browser.close()
-      } catch {}
+      try { entry.process.kill() } catch {}
       activeBrowsers.delete(profile.id)
 
-      // Re-launch with updated profile
       const updatedProfile = getProfileById(profile.id)
       if (updatedProfile) {
-        updatedProfile.startUrl = currentUrl
-        // Small delay to let browser fully close
         await new Promise(r => setTimeout(r, 1500))
         await launchProfileBrowser(updatedProfile)
       }
@@ -269,12 +263,6 @@ function stopProxyRotation(profileId: string): void {
 }
 
 export { startProxyRotation, stopProxyRotation }
-
-function getPuppeteer(): any {
-  const pup = require('puppeteer-core')
-  logToFile('puppeteer-core loaded successfully')
-  return pup
-}
 
 function getChromePath(): string {
   const platform = process.platform
@@ -317,28 +305,8 @@ function getChromePath(): string {
   return fallback
 }
 
-function getBadgeScript(name: string, color: string): string {
-  return `(function(){
-    if (document.getElementById('__mb_badge')) return;
-    var badge = document.createElement('div');
-    badge.id = '__mb_badge';
-    badge.textContent = ${JSON.stringify(name)};
-    badge.style.cssText = 'position:fixed;top:6px;right:6px;z-index:2147483647;background:${color};color:#fff;font-size:12px;font-weight:bold;padding:3px 10px;border-radius:12px;opacity:0.9;pointer-events:none;font-family:system-ui,sans-serif;box-shadow:0 2px 6px rgba(0,0,0,0.4);letter-spacing:0.3px;';
-    if (document.body) document.body.appendChild(badge);
-    else document.addEventListener('DOMContentLoaded', function(){ document.body.appendChild(badge); });
-  })()`
-}
-
-function injectBadge(page: any, name: string, color: string): void {
-  const script = getBadgeScript(name, color)
-  // Inject for future navigations
-  page.evaluateOnNewDocument(script).catch(() => {})
-  // Inject on current page
-  page.evaluate(script).catch(() => {})
-  // Re-inject after each navigation
-  page.on('framenavigated', () => {
-    page.evaluate(script).catch(() => {})
-  })
+function getUserDataDir(profileId: string): string {
+  return path.join(app.getPath('userData'), 'profiles', profileId)
 }
 
 function getScreenshotDir(): string {
@@ -347,42 +315,18 @@ function getScreenshotDir(): string {
   return dir
 }
 
-async function takeScreenshot(profileId: string): Promise<void> {
-  const entry = activeBrowsers.get(profileId)
-  if (!entry) return
-  try {
-    const pages = await entry.browser.pages()
-    if (pages.length === 0) return
-    const screenshotPath = path.join(getScreenshotDir(), `${profileId}.png`)
-    await pages[0].screenshot({ path: screenshotPath, type: 'png', quality: undefined })
-    logToFile(`Screenshot saved for ${profileId}`)
-  } catch {}
-}
-
 export function getScreenshotPath(profileId: string): string | null {
   const p = path.join(getScreenshotDir(), `${profileId}.png`)
   return fs.existsSync(p) ? p : null
 }
-
-function getUserDataDir(profileId: string): string {
-  return path.join(app.getPath('userData'), 'profiles', profileId)
-}
-
 
 export async function launchProfileBrowser(profile: Profile): Promise<void> {
   logToFile(`Launch requested for: ${profile.name}`)
 
   const existing = activeBrowsers.get(profile.id)
   if (existing) {
-    try {
-      const pages = await existing.browser.pages()
-      if (pages.length > 0) {
-        await pages[0].bringToFront()
-        return
-      }
-    } catch {
-      activeBrowsers.delete(profile.id)
-    }
+    logToFile(`Profile ${profile.name} already running`)
+    return
   }
 
   const fp = profile.fingerprint
@@ -393,9 +337,27 @@ export async function launchProfileBrowser(profile: Profile): Promise<void> {
     throw new Error(`Chromium not found at: ${executablePath}. Install Ungoogled Chromium or place it in resources/chromium.`)
   }
 
-  logToFile(`Launching with executablePath: ${executablePath}, userDataDir: ${userDataDir}`)
+  if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true })
+
+  logToFile(`Native launching: ${executablePath}, userDataDir: ${userDataDir}`)
+
+  const proxy = (profile.proxy && profile.proxy.type !== 'none' && profile.proxy.host && profile.proxy.port)
+    ? profile.proxy : undefined
+
+  const stealthExtPath = generateProfileExtensions(fp, profile.id, proxy as any)
+
+  const globalExts = getGlobalExtensions()
+  const profileExtIds = profile.extensions || []
+  const allExts = getAllExtensions()
+  const profileExts = allExts.filter(e => profileExtIds.includes(e.id) && e.enabled)
+  const extPaths = [...globalExts, ...profileExts]
+    .filter((e, i, arr) => arr.findIndex(x => x.id === e.id) === i)
+    .map(e => e.path)
+    .filter(p => fs.existsSync(p))
+  extPaths.push(stealthExtPath)
 
   const launchArgs = [
+    `--user-data-dir=${userDataDir}`,
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-blink-features=AutomationControlled',
@@ -415,116 +377,44 @@ export async function launchProfileBrowser(profile: Profile): Promise<void> {
     '--no-service-autorun',
     '--password-store=basic',
     '--use-mock-keychain',
-    '--export-tagged-pdf',
     '--disable-webrtc-hw-encoding',
     '--disable-webrtc-hw-decoding',
     '--enforce-webrtc-ip-permission-check',
     '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-    '--disable-features=IsolateOrigins',
     '--disable-site-isolation-trials',
     `--window-size=${fp.viewport.width},${fp.viewport.height}`,
     `--lang=${fp.locale}`,
+    `--load-extension=${extPaths.join(',')}`,
+    `--disable-extensions-except=${extPaths.join(',')}`,
   ]
 
-  // Load extensions
-  const globalExts = getGlobalExtensions()
-  const profileExtIds = profile.extensions || []
-  const allExts = getAllExtensions()
-  const profileExts = allExts.filter(e => profileExtIds.includes(e.id) && e.enabled)
-  const extPaths = [...globalExts, ...profileExts]
-    .filter((e, i, arr) => arr.findIndex(x => x.id === e.id) === i)
-    .map(e => e.path)
-    .filter(p => fs.existsSync(p))
-
-  // Generate per-profile stealth extension
-  const stealthExtPath = generateProfileStealthExtension(fp, profile.id)
-  extPaths.push(stealthExtPath)
-
-  if (extPaths.length > 0) {
-    launchArgs.push(`--load-extension=${extPaths.join(',')}`)
-    launchArgs.push(`--disable-extensions-except=${extPaths.join(',')}`)
+  if (proxy) {
+    launchArgs.push(`--proxy-server=${proxy.type}://${proxy.host}:${proxy.port}`)
   }
-
-  if (profile.proxy && profile.proxy.type !== 'none') {
-    const { type, host, port } = profile.proxy
-    if (host && port) {
-      launchArgs.push(`--proxy-server=${type}://${host}:${port}`)
-    }
-  }
-
-  const puppeteer = getPuppeteer()
-
-  const browser = await puppeteer.launch({
-    headless: false,
-    executablePath,
-    defaultViewport: {
-      width: fp.viewport.width,
-      height: fp.viewport.height,
-      deviceScaleFactor: fp.deviceScaleFactor,
-    },
-    userDataDir,
-    args: launchArgs,
-    ignoreDefaultArgs: ['--enable-automation', '--enable-blink-features=IdleDetection', '--disable-component-extensions-with-background-pages'],
-    ignoreHTTPSErrors: true,
-  })
-
-  activeBrowsers.set(profile.id, { browser, fingerprint: fp })
-
-  const pages = await browser.pages()
-  const page = pages[0] || await browser.newPage()
-
-  await page.setUserAgent(fp.userAgent)
-
-  if (profile.proxy?.username && profile.proxy?.password) {
-    await page.authenticate({
-      username: profile.proxy.username,
-      password: profile.proxy.password,
-    })
-  }
-
-  await page.emulateTimezone(fp.timezone)
-  await page.setExtraHTTPHeaders({ 'Accept-Language': `${fp.locale},en;q=0.9` })
-
-  // Apply UA/timezone to new pages/popups (Google OAuth opens popup windows)
-  browser.on('targetcreated', async (target: any) => {
-    try {
-      if (target.type() === 'page') {
-        const newPage = await target.page()
-        if (newPage) {
-          await newPage.setUserAgent(fp.userAgent)
-          await newPage.emulateTimezone(fp.timezone)
-          await newPage.setExtraHTTPHeaders({ 'Accept-Language': `${fp.locale},en;q=0.9` })
-          if (profile.proxy?.username && profile.proxy?.password) {
-            await newPage.authenticate({ username: profile.proxy.username, password: profile.proxy.password })
-          }
-        }
-      }
-    } catch {}
-  })
-
-  // Inject profile badge overlay on the original launchProfileBrowser
-  injectBadge(page, profile.name, profile.color)
 
   const startUrl = profile.startUrl || 'https://www.google.com'
-  page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {})
+  launchArgs.push(startUrl)
 
-  // Periodic screenshot
-  const ssInterval = setInterval(() => { takeScreenshot(profile.id) }, 30000)
-  // Take first screenshot after page loads
-  setTimeout(() => { takeScreenshot(profile.id) }, 5000)
+  const chromeProcess = spawn(executablePath, launchArgs, {
+    detached: true,
+    stdio: 'ignore',
+  })
 
-  // Proxy rotation scheduler
+  chromeProcess.unref()
+
+  activeBrowsers.set(profile.id, { process: chromeProcess, fingerprint: fp })
+
+  chromeProcess.on('exit', () => {
+    stopProxyRotation(profile.id)
+    activeBrowsers.delete(profile.id)
+    logToFile(`Browser exited for: ${profile.name}`)
+  })
+
   if (profile.proxyRotateInterval && profile.proxyRotateInterval > 0 && profile.proxyPool && profile.proxyPool.length > 1) {
     startProxyRotation(profile)
   }
 
-  browser.on('disconnected', () => {
-    clearInterval(ssInterval)
-    stopProxyRotation(profile.id)
-    activeBrowsers.delete(profile.id)
-  })
-
-  logToFile(`Browser window opened for: ${profile.name}`)
+  logToFile(`Native browser launched for: ${profile.name}`)
 }
 
 export function getProfileFingerprint(profileId: string): Fingerprint | null {
@@ -532,18 +422,8 @@ export function getProfileFingerprint(profileId: string): Fingerprint | null {
   return entry?.fingerprint || null
 }
 
-export async function getProfileCookies(profileId: string): Promise<any[]> {
-  const entry = activeBrowsers.get(profileId)
-  if (!entry) return []
-  try {
-    const pages = await entry.browser.pages()
-    if (pages.length === 0) return []
-    const client = await pages[0].target().createCDPSession()
-    const { cookies } = await client.send('Network.getAllCookies')
-    return cookies
-  } catch {
-    return []
-  }
+export async function getProfileCookies(_profileId: string): Promise<any[]> {
+  return []
 }
 
 export function isProfileRunning(profileId: string): boolean {
@@ -552,7 +432,7 @@ export function isProfileRunning(profileId: string): boolean {
 
 export function getActiveBrowser(profileId: string): any | null {
   const entry = activeBrowsers.get(profileId)
-  return entry?.browser || null
+  return entry?.process || null
 }
 
 export function getRunningProfileIds(): string[] {
@@ -579,9 +459,6 @@ export function getSyncEnabledIds(): string[] {
 
 export function setMasterProfile(profileId: string | null): void {
   masterProfileId = profileId
-  if (profileId) {
-    logToFile(`Master profile set: ${profileId}`)
-  }
 }
 
 export function getMasterProfileId(): string | null {
@@ -589,247 +466,39 @@ export function getMasterProfileId(): string | null {
 }
 
 export function startMirrorLoop(): void {
-  stopMirrorLoop()
-  mirrorInterval = setInterval(async () => {
-    if (!masterProfileId) return
-    const events = await pollMasterEvents()
-    if (events.length > 0) {
-      await replayEventsToSynced(events)
-    }
-  }, 80)
-  logToFile('Mirror loop started')
+  logToFile('Mirror mode not available in native launch mode')
 }
 
 export function stopMirrorLoop(): void {
   if (mirrorInterval) {
     clearInterval(mirrorInterval)
     mirrorInterval = null
-    logToFile('Mirror loop stopped')
   }
 }
 
-export async function startMirrorMode(profileId: string): Promise<void> {
-  masterProfileId = profileId
-  const entry = activeBrowsers.get(profileId)
-  if (!entry) return
-
-  const pages = await entry.browser.pages()
-  if (pages.length === 0) return
-  const page = pages[0]
-
-  const mirrorScript = `(function(){
-    if (window.__mirrorInjected) return;
-    window.__mirrorInjected = true;
-    window.__mirrorQueue = [];
-
-    var vw = function(){ return window.innerWidth; };
-    var vh = function(){ return window.innerHeight; };
-
-    document.addEventListener('mousemove', function(e) {
-      var q = window.__mirrorQueue;
-      if (q.length > 0 && q[q.length - 1].type === 'mousemove') {
-        q[q.length - 1] = { type: 'mousemove', relX: e.clientX / vw(), relY: e.clientY / vh(), ts: Date.now() };
-      } else {
-        q.push({ type: 'mousemove', relX: e.clientX / vw(), relY: e.clientY / vh(), ts: Date.now() });
-      }
-    }, true);
-
-    document.addEventListener('mousedown', function(e) {
-      window.__mirrorQueue.push({ type: 'mousedown', relX: e.clientX / vw(), relY: e.clientY / vh(), button: e.button, ts: Date.now() });
-    }, true);
-
-    document.addEventListener('mouseup', function(e) {
-      window.__mirrorQueue.push({ type: 'mouseup', relX: e.clientX / vw(), relY: e.clientY / vh(), button: e.button, ts: Date.now() });
-    }, true);
-
-    document.addEventListener('click', function(e) {
-      window.__mirrorQueue.push({ type: 'click', relX: e.clientX / vw(), relY: e.clientY / vh(), ts: Date.now() });
-    }, true);
-
-    document.addEventListener('scroll', function() {
-      window.__mirrorQueue.push({ type: 'scroll', scrollX: window.scrollX, scrollY: window.scrollY, ts: Date.now() });
-    }, true);
-
-    document.addEventListener('keydown', function(e) {
-      if (e.key.length === 1) {
-        window.__mirrorQueue.push({ type: 'key', key: e.key, ts: Date.now() });
-      } else if (['Enter','Backspace','Tab','Escape','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Delete','Home','End'].indexOf(e.key) !== -1) {
-        window.__mirrorQueue.push({ type: 'specialkey', key: e.key, ts: Date.now() });
-      }
-    }, true);
-  })()`
-
-  // Inject on current page immediately
-  await page.evaluate(mirrorScript).catch(() => {})
-
-  // Also inject for future navigations
-  await page.evaluateOnNewDocument(mirrorScript).catch(() => {})
-
-  // Listen for new pages/tabs in this browser and inject there too
-  entry.browser.on('targetcreated', async (target: any) => {
-    try {
-      if (target.type() === 'page') {
-        const newPage = await target.page()
-        if (newPage) {
-          await newPage.evaluateOnNewDocument(mirrorScript).catch(() => {})
-          await newPage.evaluate(mirrorScript).catch(() => {})
-        }
-      }
-    } catch {}
-  })
-
-  logToFile(`Mirror mode started for: ${profileId}`)
+export async function startMirrorMode(_profileId: string): Promise<void> {
+  logToFile('Mirror mode not available in native launch mode')
 }
 
 export async function pollMasterEvents(): Promise<any[]> {
-  if (!masterProfileId) return []
-  const entry = activeBrowsers.get(masterProfileId)
-  if (!entry) return []
-
-  try {
-    const pages = await entry.browser.pages()
-    if (pages.length === 0) return []
-    const page = pages[0]
-    const events = await page.evaluate(`(function(){
-      var q = window.__mirrorQueue || [];
-      window.__mirrorQueue = [];
-      return q;
-    })()`).catch(() => [])
-    return events || []
-  } catch {
-    return []
-  }
+  return []
 }
 
-// Replay a batch of events to all synced browsers (except master)
-export async function replayEventsToSynced(events: any[]): Promise<void> {
-  const ids = getSyncEnabledIds().filter(id => id !== masterProfileId)
-  if (ids.length === 0 || events.length === 0) return
+export async function replayEventsToSynced(_events: any[]): Promise<void> {}
 
-  await Promise.allSettled(ids.map(async (id) => {
-    const entry = activeBrowsers.get(id)
-    if (!entry) return
-    const pages = await entry.browser.pages()
-    if (pages.length === 0) return
-    const page = pages[0]
-    const vp = await page.viewport()
-    const vpW = vp?.width || 1280
-    const vpH = vp?.height || 720
+export async function syncNavigate(_url: string): Promise<void> {}
 
-    for (const evt of events) {
-      try {
-        if (evt.type === 'mousemove' && evt.relX != null && evt.relY != null) {
-          await page.mouse.move(Math.round(evt.relX * vpW), Math.round(evt.relY * vpH))
-        } else if (evt.type === 'mousedown' && evt.relX != null && evt.relY != null) {
-          await page.mouse.move(Math.round(evt.relX * vpW), Math.round(evt.relY * vpH))
-          await page.mouse.down({ button: evt.button === 2 ? 'right' : 'left' })
-        } else if (evt.type === 'mouseup') {
-          await page.mouse.up({ button: evt.button === 2 ? 'right' : 'left' })
-        } else if (evt.type === 'click' && evt.relX != null && evt.relY != null) {
-          // Use click as fallback — move + click in one action
-          await page.mouse.click(Math.round(evt.relX * vpW), Math.round(evt.relY * vpH))
-        } else if (evt.type === 'scroll' && evt.scrollX != null && evt.scrollY != null) {
-          await page.evaluate(`window.scrollTo(${evt.scrollX}, ${evt.scrollY})`)
-        } else if (evt.type === 'key' && evt.key) {
-          await page.keyboard.press(evt.key)
-        } else if (evt.type === 'specialkey' && evt.key) {
-          await page.keyboard.press(evt.key)
-        }
-      } catch {}
-    }
-  }))
-}
+export async function syncClick(_x: number, _y: number): Promise<void> {}
 
-export async function syncNavigate(url: string): Promise<void> {
-  const ids = getSyncEnabledIds()
-  await Promise.allSettled(ids.map(async (id) => {
-    const entry = activeBrowsers.get(id)
-    if (!entry) return
-    const pages = await entry.browser.pages()
-    if (pages.length > 0) {
-      pages[0].goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {})
-    }
-  }))
-}
+export async function syncClickAbsolute(_x: number, _y: number): Promise<void> {}
 
-export async function syncClick(x: number, y: number): Promise<void> {
-  const ids = getSyncEnabledIds()
-  await Promise.allSettled(ids.map(async (id) => {
-    const entry = activeBrowsers.get(id)
-    if (!entry) return
-    const pages = await entry.browser.pages()
-    if (pages.length > 0) {
-      // Use relative coordinates: x and y are percentages (0-1)
-      const vp = await pages[0].viewport()
-      const absX = Math.round(x * (vp?.width || 1280))
-      const absY = Math.round(y * (vp?.height || 720))
-      await pages[0].mouse.click(absX, absY).catch(() => {})
-    }
-  }))
-}
+export async function syncMouseMove(_relX: number, _relY: number): Promise<void> {}
 
-export async function syncClickAbsolute(x: number, y: number): Promise<void> {
-  const ids = getSyncEnabledIds()
-  await Promise.allSettled(ids.map(async (id) => {
-    const entry = activeBrowsers.get(id)
-    if (!entry) return
-    const pages = await entry.browser.pages()
-    if (pages.length > 0) {
-      await pages[0].mouse.click(x, y).catch(() => {})
-    }
-  }))
-}
+export async function syncType(_text: string): Promise<void> {}
 
-export async function syncMouseMove(relX: number, relY: number): Promise<void> {
-  const ids = getSyncEnabledIds().filter(id => id !== masterProfileId)
-  await Promise.allSettled(ids.map(async (id) => {
-    const entry = activeBrowsers.get(id)
-    if (!entry) return
-    const pages = await entry.browser.pages()
-    if (pages.length > 0) {
-      const vp = await pages[0].viewport()
-      const absX = Math.round(relX * (vp?.width || 1280))
-      const absY = Math.round(relY * (vp?.height || 720))
-      await pages[0].mouse.move(absX, absY).catch(() => {})
-    }
-  }))
-}
+export async function syncScroll(_deltaY: number): Promise<void> {}
 
-export async function syncType(text: string): Promise<void> {
-  const ids = getSyncEnabledIds()
-  await Promise.allSettled(ids.map(async (id) => {
-    const entry = activeBrowsers.get(id)
-    if (!entry) return
-    const pages = await entry.browser.pages()
-    if (pages.length > 0) {
-      await pages[0].keyboard.type(text).catch(() => {})
-    }
-  }))
-}
-
-export async function syncScroll(deltaY: number): Promise<void> {
-  const ids = getSyncEnabledIds()
-  await Promise.allSettled(ids.map(async (id) => {
-    const entry = activeBrowsers.get(id)
-    if (!entry) return
-    const pages = await entry.browser.pages()
-    if (pages.length > 0) {
-      await pages[0].evaluate((dy: number) => window.scrollBy(0, dy), deltaY).catch(() => {})
-    }
-  }))
-}
-
-export async function syncScrollTo(scrollX: number, scrollY: number): Promise<void> {
-  const ids = getSyncEnabledIds().filter(id => id !== masterProfileId)
-  await Promise.allSettled(ids.map(async (id) => {
-    const entry = activeBrowsers.get(id)
-    if (!entry) return
-    const pages = await entry.browser.pages()
-    if (pages.length > 0) {
-      await pages[0].evaluate((sx: number, sy: number) => window.scrollTo(sx, sy), scrollX, scrollY).catch(() => {})
-    }
-  }))
-}
+export async function syncScrollTo(_scrollX: number, _scrollY: number): Promise<void> {}
 
 function calculateGrid(count: number): { cols: number; rows: number } {
   if (count <= 1) return { cols: 1, rows: 1 }
@@ -864,7 +533,6 @@ export async function multiLaunch(profiles: import('@shared/types').Profile[]): 
       const posY = offsetY + row * cellH
       return launchProfileBrowserTiled(p, posX, posY, cellW, cellH)
     }))
-    // Delay between batches to avoid system overload
     if (i + BATCH_SIZE < profiles.length) {
       await new Promise(r => setTimeout(r, BATCH_DELAY_MS))
     }
@@ -881,27 +549,26 @@ async function launchProfileBrowserTiled(
   logToFile(`Tiled launch for: ${profile.name} at (${posX},${posY}) ${width}x${height}`)
 
   const existing = activeBrowsers.get(profile.id)
-  if (existing) {
-    try {
-      const pages = await existing.browser.pages()
-      if (pages.length > 0) {
-        await pages[0].bringToFront()
-        return
-      }
-    } catch {
-      activeBrowsers.delete(profile.id)
-    }
-  }
+  if (existing) return
 
   const fp = profile.fingerprint
   const userDataDir = getUserDataDir(profile.id)
   const executablePath = getChromePath()
 
   if (!fs.existsSync(executablePath)) {
-    throw new Error(`Chromium not found at: ${executablePath}. Install Ungoogled Chromium or place it in resources/chromium.`)
+    throw new Error(`Chromium not found at: ${executablePath}`)
   }
 
+  if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true })
+
+  const proxy = (profile.proxy && profile.proxy.type !== 'none' && profile.proxy.host && profile.proxy.port)
+    ? profile.proxy : undefined
+
+  const stealthExtPath = generateProfileExtensions(fp, profile.id, proxy as any)
+  const extPaths = [stealthExtPath]
+
   const launchArgs = [
+    `--user-data-dir=${userDataDir}`,
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-blink-features=AutomationControlled',
@@ -921,78 +588,34 @@ async function launchProfileBrowserTiled(
     '--no-service-autorun',
     '--password-store=basic',
     '--use-mock-keychain',
-    '--export-tagged-pdf',
     '--disable-webrtc-hw-encoding',
     '--disable-webrtc-hw-decoding',
     '--enforce-webrtc-ip-permission-check',
     '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-    '--disable-features=IsolateOrigins',
     '--disable-site-isolation-trials',
     `--window-size=${width},${height}`,
     `--window-position=${posX},${posY}`,
     `--lang=${fp.locale}`,
+    `--load-extension=${extPaths.join(',')}`,
+    `--disable-extensions-except=${extPaths.join(',')}`,
   ]
 
-  if (profile.proxy && profile.proxy.type !== 'none') {
-    const { type, host, port } = profile.proxy
-    if (host && port) {
-      launchArgs.push(`--proxy-server=${type}://${host}:${port}`)
-    }
+  if (proxy) {
+    launchArgs.push(`--proxy-server=${proxy.type}://${proxy.host}:${proxy.port}`)
   }
-
-  // Generate per-profile stealth extension for tiled launch
-  const stealthExtPath = generateProfileStealthExtension(fp, profile.id)
-  const tiledExtPaths = [stealthExtPath]
-  if (tiledExtPaths.length > 0) {
-    launchArgs.push(`--load-extension=${tiledExtPaths.join(',')}`)
-    launchArgs.push(`--disable-extensions-except=${tiledExtPaths.join(',')}`)
-  }
-
-  const puppeteer = getPuppeteer()
-
-  const browser = await puppeteer.launch({
-    headless: false,
-    executablePath,
-    defaultViewport: {
-      width: width - 16,
-      height: height - 88,
-      deviceScaleFactor: fp.deviceScaleFactor,
-    },
-    userDataDir,
-    args: launchArgs,
-    ignoreDefaultArgs: ['--enable-automation', '--enable-blink-features=IdleDetection', '--disable-component-extensions-with-background-pages'],
-    ignoreHTTPSErrors: true,
-  })
-
-  activeBrowsers.set(profile.id, { browser, fingerprint: fp })
-
-  const pages = await browser.pages()
-  const page = pages[0] || await browser.newPage()
-
-  await page.setUserAgent(fp.userAgent)
-
-  if (profile.proxy?.username && profile.proxy?.password) {
-    await page.authenticate({
-      username: profile.proxy.username,
-      password: profile.proxy.password,
-    })
-  }
-
-  await page.emulateTimezone(fp.timezone)
-  await page.setExtraHTTPHeaders({ 'Accept-Language': `${fp.locale},en;q=0.9` })
-
-  // Inject profile badge overlay on tiled launch
-  injectBadge(page, profile.name, profile.color)
 
   const startUrl = profile.startUrl || 'https://www.google.com'
-  page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {})
+  launchArgs.push(startUrl)
 
-  // Periodic screenshot
-  const ssInterval = setInterval(() => { takeScreenshot(profile.id) }, 30000)
-  setTimeout(() => { takeScreenshot(profile.id) }, 5000)
+  const chromeProcess = spawn(executablePath, launchArgs, {
+    detached: true,
+    stdio: 'ignore',
+  })
+  chromeProcess.unref()
 
-  browser.on('disconnected', () => {
-    clearInterval(ssInterval)
+  activeBrowsers.set(profile.id, { process: chromeProcess, fingerprint: fp })
+
+  chromeProcess.on('exit', () => {
     activeBrowsers.delete(profile.id)
     if (masterProfileId === profile.id) masterProfileId = null
   })
@@ -1001,7 +624,7 @@ async function launchProfileBrowserTiled(
 export async function closeBrowser(profileId: string): Promise<void> {
   const entry = activeBrowsers.get(profileId)
   if (entry) {
-    try { await entry.browser.close() } catch {}
+    try { entry.process.kill() } catch {}
     activeBrowsers.delete(profileId)
     syncEnabled.delete(profileId)
     if (masterProfileId === profileId) masterProfileId = null
@@ -1010,7 +633,7 @@ export async function closeBrowser(profileId: string): Promise<void> {
 
 export async function closeAllBrowsers(): Promise<void> {
   for (const [id, entry] of activeBrowsers) {
-    try { await entry.browser.close() } catch {}
+    try { entry.process.kill() } catch {}
     activeBrowsers.delete(id)
   }
   syncEnabled.clear()
