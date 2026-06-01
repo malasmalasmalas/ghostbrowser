@@ -4,6 +4,179 @@ import { app, screen } from 'electron'
 import { Profile, Fingerprint } from '@shared/types'
 import { getGlobalExtensions, getAllExtensions, getProxyById, getProfileById, updateProfileRecord } from './db'
 
+function getStealthExtensionPath(): string {
+  const isPackaged = app.isPackaged
+  if (isPackaged) {
+    return path.join(process.resourcesPath, 'stealth-extension')
+  }
+  return path.join(app.getAppPath(), 'src', 'main', 'stealth-extension')
+}
+
+function generateProfileStealthExtension(fp: Fingerprint, profileId: string): string {
+  const extDir = path.join(app.getPath('userData'), 'stealth-ext', profileId)
+  if (!fs.existsSync(extDir)) fs.mkdirSync(extDir, { recursive: true })
+
+  const manifest = {
+    manifest_version: 3,
+    name: 'Browser Helper',
+    version: '1.0.0',
+    description: 'Browser enhancement utility',
+    content_scripts: [{
+      matches: ['<all_urls>'],
+      js: ['stealth.js', 'fingerprint.js'],
+      run_at: 'document_start',
+      all_frames: true,
+      world: 'MAIN'
+    }],
+    permissions: []
+  }
+  fs.writeFileSync(path.join(extDir, 'manifest.json'), JSON.stringify(manifest, null, 2))
+
+  const baseStealth = path.join(getStealthExtensionPath(), 'stealth.js')
+  if (fs.existsSync(baseStealth)) {
+    fs.copyFileSync(baseStealth, path.join(extDir, 'stealth.js'))
+  }
+
+  const fpScript = `(function(){
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => ${fp.hardwareConcurrency} });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => ${fp.deviceMemory} });
+    Object.defineProperty(navigator, 'platform', { get: () => ${JSON.stringify(fp.platform)} });
+    Object.defineProperty(navigator, 'languages', { get: () => Object.freeze([${JSON.stringify(fp.locale)}, 'en']) });
+    Object.defineProperty(navigator, 'language', { get: () => ${JSON.stringify(fp.locale)} });
+    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => ${fp.isMobile ? 5 : 0} });
+    Object.defineProperty(screen, 'colorDepth', { get: () => ${fp.screenDepth} });
+    Object.defineProperty(screen, 'pixelDepth', { get: () => ${fp.screenDepth} });
+    Object.defineProperty(screen, 'width', { get: () => ${fp.viewport.width} });
+    Object.defineProperty(screen, 'height', { get: () => ${fp.viewport.height} });
+    Object.defineProperty(screen, 'availWidth', { get: () => ${fp.viewport.width} });
+    Object.defineProperty(screen, 'availHeight', { get: () => ${fp.viewport.height - 40} });
+    Object.defineProperty(window, 'outerWidth', { get: () => ${fp.viewport.width} });
+    Object.defineProperty(window, 'outerHeight', { get: () => ${fp.viewport.height + 80} });
+    Object.defineProperty(window, 'devicePixelRatio', { get: () => ${fp.deviceScaleFactor} });
+    Object.defineProperty(navigator, 'appVersion', { get: () => ${JSON.stringify(fp.userAgent.replace('Mozilla/', ''))} });
+
+    // WebGL
+    (function(){
+      var origGetParam = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(p) {
+        if (p === 37445) return ${JSON.stringify(fp.webglVendor)};
+        if (p === 37446) return ${JSON.stringify(fp.webglRenderer)};
+        return origGetParam.call(this, p);
+      };
+      if (typeof WebGL2RenderingContext !== 'undefined') {
+        var orig2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(p) {
+          if (p === 37445) return ${JSON.stringify(fp.webglVendor)};
+          if (p === 37446) return ${JSON.stringify(fp.webglRenderer)};
+          return orig2.call(this, p);
+        };
+      }
+      var origGetExt = WebGLRenderingContext.prototype.getExtension;
+      WebGLRenderingContext.prototype.getExtension = function(name) {
+        if (name === 'WEBGL_debug_renderer_info') return null;
+        return origGetExt.call(this, name);
+      };
+    })();
+
+    // Canvas noise
+    (function(){
+      var origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+      HTMLCanvasElement.prototype.toDataURL = function() {
+        var ctx = this.getContext('2d');
+        if (ctx && this.width > 0 && this.height > 0) {
+          try {
+            var imageData = ctx.getImageData(0, 0, Math.min(this.width, 16), Math.min(this.height, 16));
+            var noise = ${(fp.hardwareConcurrency * 7 + fp.deviceMemory * 3) % 10};
+            for (var i = 0; i < imageData.data.length; i += 4) {
+              imageData.data[i] = (imageData.data[i] + noise) % 256;
+            }
+            ctx.putImageData(imageData, 0, 0);
+          } catch(e) {}
+        }
+        return origToDataURL.apply(this, arguments);
+      };
+    })();
+
+    // AudioContext noise
+    (function(){
+      var seed = ${fp.hardwareConcurrency * 13 + fp.deviceMemory * 7};
+      var origGetChannelData = AudioBuffer.prototype.getChannelData;
+      AudioBuffer.prototype.getChannelData = function(ch) {
+        var data = origGetChannelData.call(this, ch);
+        if (this.numberOfChannels === 1 && this.length < 1000) {
+          for (var i = 0; i < data.length; i++) {
+            data[i] = data[i] + (((seed + i) % 100) / 10000000);
+          }
+        }
+        return data;
+      };
+    })();
+
+    // ClientRects noise
+    (function(){
+      var noise = ${(fp.hardwareConcurrency * 3 + fp.deviceMemory * 7) % 10} * 0.00001;
+      var origRect = Element.prototype.getBoundingClientRect;
+      Element.prototype.getBoundingClientRect = function() {
+        var r = origRect.call(this);
+        return new DOMRect(r.x + noise, r.y + noise, r.width + noise, r.height + noise);
+      };
+    })();
+
+    // Font spoofing
+    (function(){
+      var fakeFonts = ${JSON.stringify(fp.fonts)};
+      var origMeasure = CanvasRenderingContext2D.prototype.measureText;
+      var baseFonts = ['monospace', 'sans-serif', 'serif'];
+      CanvasRenderingContext2D.prototype.measureText = function(text) {
+        var result = origMeasure.call(this, text);
+        var font = this.font || '';
+        var isFontTest = text.length > 5 && baseFonts.some(function(b){ return font.includes(b); });
+        if (isFontTest) {
+          var fontName = font.replace(/[0-9px\\s]/g, '').split(',')[0];
+          if (fontName && !fakeFonts.includes(fontName) && !baseFonts.includes(fontName)) {
+            Object.defineProperty(result, 'width', { value: result.width + (${fp.hardwareConcurrency % 3} - 1) * 0.1 });
+          }
+        }
+        return result;
+      };
+    })();
+
+    // WebRTC leak protection
+    (function(){
+      var origRTC = window.RTCPeerConnection || window.webkitRTCPeerConnection;
+      if (!origRTC) return;
+      var newRTC = function(config, constraints) {
+        if (config && config.iceServers) {
+          config.iceServers = config.iceServers.filter(function(s) {
+            var urls = Array.isArray(s.urls) ? s.urls : [s.urls || s.url];
+            return urls.some(function(u) { return u && !u.startsWith('stun:'); });
+          });
+        }
+        return new origRTC(config, constraints);
+      };
+      newRTC.prototype = origRTC.prototype;
+      Object.keys(origRTC).forEach(function(k) { try { newRTC[k] = origRTC[k]; } catch(e){} });
+      newRTC.generateCertificate = origRTC.generateCertificate;
+      window.RTCPeerConnection = newRTC;
+      if (window.webkitRTCPeerConnection) window.webkitRTCPeerConnection = newRTC;
+    })();
+
+    // Speech synthesis
+    if (window.speechSynthesis) {
+      window.speechSynthesis.getVoices = function() {
+        return [
+          {name:'Microsoft David - English (United States)',lang:'en-US',localService:true,default:true,voiceURI:'Microsoft David - English (United States)'},
+          {name:'Microsoft Zira - English (United States)',lang:'en-US',localService:true,default:false,voiceURI:'Microsoft Zira - English (United States)'},
+          {name:'Google US English',lang:'en-US',localService:false,default:false,voiceURI:'Google US English'}
+        ];
+      };
+    }
+  })();`
+  fs.writeFileSync(path.join(extDir, 'fingerprint.js'), fpScript)
+
+  return extDir
+}
+
 const activeBrowsers = new Map<string, { browser: any; fingerprint: Fingerprint }>()
 const proxyRotationTimers = new Map<string, ReturnType<typeof setInterval>>()
 let masterProfileId: string | null = null
@@ -195,446 +368,6 @@ function getUserDataDir(profileId: string): string {
   return path.join(app.getPath('userData'), 'profiles', profileId)
 }
 
-function getStealthScripts(fp: Fingerprint): string {
-  return `
-    // Webdriver - comprehensive removal
-    Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
-    const navProto = Object.getPrototypeOf(navigator);
-    if (Object.getOwnPropertyDescriptor(navProto, 'webdriver')) {
-      Object.defineProperty(navProto, 'webdriver', { get: () => false, configurable: true });
-    }
-
-    // Remove automation indicators from window
-    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-    delete window.cdc_adoQpoasnfa76pfcZLmcfl_JSON;
-    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Object;
-    for (const key of Object.keys(window)) {
-      if (key.match(/^cdc_/) || key.match(/^__webdriver/) || key.match(/^__selenium/) || key.match(/^__driver/)) {
-        delete window[key];
-      }
-    }
-
-    // Document focus - always report focused
-    Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
-    Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
-    document.hasFocus = () => true;
-
-    // Navigator props
-    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => ${fp.hardwareConcurrency} });
-    Object.defineProperty(navigator, 'deviceMemory', { get: () => ${fp.deviceMemory} });
-    Object.defineProperty(navigator, 'platform', { get: () => ${JSON.stringify(fp.platform)} });
-    Object.defineProperty(navigator, 'languages', { get: () => Object.freeze([${JSON.stringify(fp.locale)}, 'en']) });
-    Object.defineProperty(navigator, 'language', { get: () => ${JSON.stringify(fp.locale)} });
-    Object.defineProperty(navigator, 'maxTouchPoints', { get: () => ${fp.isMobile ? 5 : 0} });
-    Object.defineProperty(screen, 'colorDepth', { get: () => ${fp.screenDepth} });
-    Object.defineProperty(screen, 'pixelDepth', { get: () => ${fp.screenDepth} });
-
-    // Spoof navigator.vendor (must be Google Inc. for Chrome)
-    Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
-
-    // Spoof navigator.appVersion
-    Object.defineProperty(navigator, 'appVersion', { get: () => ${JSON.stringify(fp.userAgent.replace('Mozilla/', ''))} });
-
-    // Prevent prototype leak detection
-    const origToString = Function.prototype.toString;
-    const nativeToString = 'function toString() { [native code] }';
-    const spoofedFns = new WeakSet();
-    Function.prototype.toString = function() {
-      if (spoofedFns.has(this)) return 'function ' + (this.name || '') + '() { [native code] }';
-      return origToString.call(this);
-    };
-    spoofedFns.add(Function.prototype.toString);
-
-    // Helper to mark functions as native-looking
-    const markNative = (fn) => { spoofedFns.add(fn); return fn; };
-
-    // Screen resolution spoofing
-    Object.defineProperty(screen, 'width', { get: () => ${fp.viewport.width} });
-    Object.defineProperty(screen, 'height', { get: () => ${fp.viewport.height} });
-    Object.defineProperty(screen, 'availWidth', { get: () => ${fp.viewport.width} });
-    Object.defineProperty(screen, 'availHeight', { get: () => ${fp.viewport.height - 40} });
-    Object.defineProperty(screen, 'availLeft', { get: () => 0 });
-    Object.defineProperty(screen, 'availTop', { get: () => 0 });
-    Object.defineProperty(window, 'outerWidth', { get: () => ${fp.viewport.width} });
-    Object.defineProperty(window, 'outerHeight', { get: () => ${fp.viewport.height + 80} });
-    Object.defineProperty(window, 'devicePixelRatio', { get: () => ${fp.deviceScaleFactor} });
-
-    // Chrome runtime - preserve existing chrome object if available, only patch if missing
-    if (!window.chrome) {
-      window.chrome = {};
-    }
-    if (!window.chrome.app) {
-      window.chrome.app = { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } };
-    }
-    if (!window.chrome.runtime) {
-      window.chrome.runtime = { OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' }, OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' }, PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }, PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }, PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' }, RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }, connect: function(){}, sendMessage: function(){} };
-    }
-    if (!window.chrome.csi) {
-      window.chrome.csi = function(){ return {}; };
-    }
-    if (!window.chrome.loadTimes) {
-      window.chrome.loadTimes = function(){ return {}; };
-    }
-
-    // Plugins & MimeTypes
-    const makePluginArray = () => {
-      const plugins = [
-        { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-        { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-        { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
-      ];
-      const arr = Object.create(PluginArray.prototype);
-      plugins.forEach((p, i) => { arr[i] = Object.create(Plugin.prototype, { name: {value:p.name}, filename: {value:p.filename}, description: {value:p.description}, length: {value:1} }); });
-      Object.defineProperty(arr, 'length', { value: plugins.length });
-      return arr;
-    };
-    Object.defineProperty(navigator, 'plugins', { get: makePluginArray });
-    Object.defineProperty(navigator, 'mimeTypes', { get: () => { const arr = Object.create(MimeTypeArray.prototype); Object.defineProperty(arr, 'length', {value:2}); return arr; } });
-
-    // Permissions - comprehensive spoofing for anti-bot bypass
-    const origQuery = window.navigator.permissions.query;
-    const permQuery = markNative(function query(params) {
-      if (params.name === 'notifications') return Promise.resolve({ state: Notification.permission || 'default', onchange: null });
-      return origQuery.call(navigator.permissions, params).catch(() => Promise.resolve({ state: 'prompt', onchange: null }));
-    });
-    window.navigator.permissions.query = permQuery;
-
-    // Notification constructor spoof
-    if (window.Notification) {
-      Object.defineProperty(Notification, 'permission', { get: () => 'default', configurable: true });
-    }
-
-    // Performance.now() noise to prevent timing attacks
-    const origPerfNow = performance.now.bind(performance);
-    performance.now = markNative(function now() {
-      return origPerfNow() + (Math.random() * 0.001);
-    });
-
-    // Prevent Error stack trace fingerprinting (CDP detection)
-    const origErrorStack = Object.getOwnPropertyDescriptor(Error.prototype, 'stack');
-    if (origErrorStack && origErrorStack.get) {
-      Object.defineProperty(Error.prototype, 'stack', {
-        get: function() {
-          const stack = origErrorStack.get.call(this);
-          if (stack && typeof stack === 'string') {
-            return stack.replace(/puppeteer/gi, '').replace(/cdp/gi, '').replace(/devtools/gi, '');
-          }
-          return stack;
-        },
-        configurable: true
-      });
-    }
-
-    // WebGL
-    (function(){
-      const origGetParameter = WebGLRenderingContext.prototype.getParameter;
-      WebGLRenderingContext.prototype.getParameter = function(param) {
-        if (param === 37445) return ${JSON.stringify(fp.webglVendor)};
-        if (param === 37446) return ${JSON.stringify(fp.webglRenderer)};
-        return origGetParameter.call(this, param);
-      };
-      if (typeof WebGL2RenderingContext !== 'undefined') {
-        const orig2 = WebGL2RenderingContext.prototype.getParameter;
-        WebGL2RenderingContext.prototype.getParameter = function(param) {
-          if (param === 37445) return ${JSON.stringify(fp.webglVendor)};
-          if (param === 37446) return ${JSON.stringify(fp.webglRenderer)};
-          return orig2.call(this, param);
-        };
-      }
-    })();
-
-    // Canvas noise
-    (function(){
-      const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-      HTMLCanvasElement.prototype.toDataURL = function() {
-        const ctx = this.getContext('2d');
-        if (ctx && this.width > 0 && this.height > 0) {
-          try {
-            const imageData = ctx.getImageData(0, 0, Math.min(this.width, 16), Math.min(this.height, 16));
-            const noise = ${(fp.hardwareConcurrency * 7 + fp.deviceMemory * 3) % 10};
-            for (let i = 0; i < imageData.data.length; i += 4) {
-              imageData.data[i] = (imageData.data[i] + noise) % 256;
-            }
-            ctx.putImageData(imageData, 0, 0);
-          } catch(e) {}
-        }
-        return origToDataURL.apply(this, arguments);
-      };
-    })();
-
-    // Iframe contentWindow - comprehensive webdriver hiding
-    const origHTMLIFrameElement = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
-    Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
-      get: function() {
-        const w = origHTMLIFrameElement.get.call(this);
-        if (w) {
-          try {
-            Object.defineProperty(w.navigator, 'webdriver', { get: () => false, configurable: true });
-            Object.defineProperty(w.document, 'hidden', { get: () => false, configurable: true });
-            Object.defineProperty(w.document, 'visibilityState', { get: () => 'visible', configurable: true });
-          } catch(e){}
-        }
-        return w;
-      }
-    });
-
-    // Iframe contentDocument
-    const origContentDoc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentDocument');
-    if (origContentDoc) {
-      Object.defineProperty(HTMLIFrameElement.prototype, 'contentDocument', {
-        get: function() {
-          const d = origContentDoc.get.call(this);
-          if (d) {
-            try {
-              Object.defineProperty(d, 'hidden', { get: () => false, configurable: true });
-              Object.defineProperty(d, 'visibilityState', { get: () => 'visible', configurable: true });
-            } catch(e){}
-          }
-          return d;
-        }
-      });
-    }
-
-    // WebRTC leak protection - prevent real IP exposure but allow connections for OAuth
-    (function(){
-      const origRTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
-      if (origRTCPeerConnection) {
-        const newRTC = function(config, constraints) {
-          if (config && config.iceServers) {
-            // Only remove STUN/TURN servers that could leak real IP, keep others
-            config.iceServers = config.iceServers.filter(function(server) {
-              var urls = Array.isArray(server.urls) ? server.urls : [server.urls || server.url];
-              return urls.some(function(u) { return u && !u.startsWith('stun:'); });
-            });
-          }
-          const pc = new origRTCPeerConnection(config, constraints);
-          return pc;
-        };
-        newRTC.prototype = origRTCPeerConnection.prototype;
-        Object.keys(origRTCPeerConnection).forEach(function(key) {
-          try { newRTC[key] = origRTCPeerConnection[key]; } catch(e) {}
-        });
-        newRTC.generateCertificate = origRTCPeerConnection.generateCertificate;
-        window.RTCPeerConnection = newRTC;
-        if (window.webkitRTCPeerConnection) window.webkitRTCPeerConnection = newRTC;
-      }
-    })();
-
-    // Prevent connection type detection
-    if (navigator.connection) {
-      Object.defineProperty(navigator.connection, 'type', { get: () => 'wifi' });
-      Object.defineProperty(navigator.connection, 'effectiveType', { get: () => '4g' });
-      Object.defineProperty(navigator.connection, 'downlink', { get: () => ${(Math.random() * 8 + 5).toFixed(1)} });
-      Object.defineProperty(navigator.connection, 'rtt', { get: () => ${Math.floor(Math.random() * 50 + 25)} });
-      Object.defineProperty(navigator.connection, 'saveData', { get: () => false });
-    }
-
-    // Battery API spoof (can reveal VM/proxy)
-    if (navigator.getBattery) {
-      navigator.getBattery = markNative(function getBattery() {
-        return Promise.resolve({
-          charging: true, chargingTime: 0, dischargingTime: Infinity, level: ${(Math.random() * 0.3 + 0.7).toFixed(2)},
-          addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => true
-        });
-      });
-    }
-
-    // Prevent Headless detection via window.outerWidth/outerHeight being 0
-    if (window.outerWidth === 0) Object.defineProperty(window, 'outerWidth', { get: () => ${fp.viewport.width} });
-    if (window.outerHeight === 0) Object.defineProperty(window, 'outerHeight', { get: () => ${fp.viewport.height + 80} });
-
-    // Spoof window.history.length (bots usually have length 1)
-    Object.defineProperty(window.history, 'length', { get: () => ${Math.floor(Math.random() * 5) + 2} });
-
-    // Prevent detection via toString on native objects
-    ['HTMLElement','HTMLDocument','Element','Node','EventTarget','Window'].forEach(function(name) {
-      try {
-        var obj = window[name];
-        if (obj && obj.prototype) {
-          Object.defineProperty(obj.prototype, Symbol.toStringTag, { get: () => name, configurable: true });
-        }
-      } catch(e) {}
-    });
-
-    // Spoof Date.getTimezoneOffset to match emulated timezone
-    // (handled by puppeteer emulateTimezone, but reinforce it)
-
-    // Prevent detection of automation via window.navigator.connection
-    if (navigator.connection) {
-      Object.defineProperty(navigator.connection, 'onchange', { value: null, writable: true });
-    }
-
-    // Spoof media devices (prevent fingerprinting via enumerateDevices)
-    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-      const origEnumerate = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
-      navigator.mediaDevices.enumerateDevices = markNative(async function enumerateDevices() {
-        const devices = await origEnumerate();
-        return devices.map(function(d, i) {
-          return { deviceId: 'id_' + i + '_' + ${JSON.stringify(fp.hardwareConcurrency.toString())}, groupId: 'group_' + i, kind: d.kind, label: '' };
-        });
-      });
-    }
-
-    // Font enumeration spoofing
-    (function(){
-      const fakeFonts = ${JSON.stringify(fp.fonts)};
-      const origMeasureText = CanvasRenderingContext2D.prototype.measureText;
-      const baseFonts = ['monospace', 'sans-serif', 'serif'];
-      const baseWidths = {};
-      CanvasRenderingContext2D.prototype.measureText = function(text) {
-        const result = origMeasureText.call(this, text);
-        const font = this.font || '';
-        const isFontTest = text.length > 5 && baseFonts.some(b => font.includes(b));
-        if (isFontTest) {
-          const fontName = font.replace(/[0-9px\s]/g, '').split(',')[0];
-          if (fontName && !fakeFonts.includes(fontName) && !baseFonts.includes(fontName)) {
-            const fakeWidth = result.width + (${fp.hardwareConcurrency % 3} - 1) * 0.1;
-            Object.defineProperty(result, 'width', { value: fakeWidth });
-          }
-        }
-        return result;
-      };
-    })();
-
-    // AudioContext fingerprint spoofing
-    (function(){
-      const seed = ${fp.hardwareConcurrency * 13 + fp.deviceMemory * 7};
-      const origCreateOscillator = AudioContext.prototype.createOscillator;
-      const origCreateDynamicsCompressor = AudioContext.prototype.createDynamicsCompressor;
-      const origGetChannelData = AudioBuffer.prototype.getChannelData;
-      AudioBuffer.prototype.getChannelData = function(channel) {
-        const data = origGetChannelData.call(this, channel);
-        if (this.numberOfChannels === 1 && this.length < 1000) {
-          for (let i = 0; i < data.length; i++) {
-            data[i] = data[i] + (((seed + i) % 100) / 10000000);
-          }
-        }
-        return data;
-      };
-      const origCopyFromChannel = AudioBuffer.prototype.copyFromChannel;
-      AudioBuffer.prototype.copyFromChannel = function(dest, ch, offset) {
-        origCopyFromChannel.call(this, dest, ch, offset || 0);
-        for (let i = 0; i < dest.length; i++) {
-          dest[i] = dest[i] + (((seed + i) % 100) / 10000000);
-        }
-      };
-    })();
-
-    // WebGL advanced fingerprint randomizer
-    (function(){
-      const seed = ${fp.hardwareConcurrency * 11 + fp.screenDepth * 5};
-      const origReadPixels = WebGLRenderingContext.prototype.readPixels;
-      WebGLRenderingContext.prototype.readPixels = function() {
-        origReadPixels.apply(this, arguments);
-        const buf = arguments[6];
-        if (buf && buf.length && buf.length < 1000) {
-          for (let i = 0; i < buf.length; i += 4) {
-            buf[i] = (buf[i] + (seed % 3)) % 256;
-          }
-        }
-      };
-      if (typeof WebGL2RenderingContext !== 'undefined') {
-        const orig2ReadPixels = WebGL2RenderingContext.prototype.readPixels;
-        WebGL2RenderingContext.prototype.readPixels = function() {
-          orig2ReadPixels.apply(this, arguments);
-          const buf = arguments[6];
-          if (buf && buf.length && buf.length < 1000) {
-            for (let i = 0; i < buf.length; i += 4) {
-              buf[i] = (buf[i] + (seed % 3)) % 256;
-            }
-          }
-        };
-      }
-      const origGetExtension = WebGLRenderingContext.prototype.getExtension;
-      WebGLRenderingContext.prototype.getExtension = function(name) {
-        const ext = origGetExtension.call(this, name);
-        if (name === 'WEBGL_debug_renderer_info') return null;
-        return ext;
-      };
-    })();
-
-    // ClientRects noise spoofing
-    (function(){
-      const noise = ${(fp.hardwareConcurrency * 3 + fp.deviceMemory * 7) % 10} * 0.00001;
-      const origGetBoundingClientRect = Element.prototype.getBoundingClientRect;
-      Element.prototype.getBoundingClientRect = function() {
-        const rect = origGetBoundingClientRect.call(this);
-        const n = noise;
-        return new DOMRect(rect.x + n, rect.y + n, rect.width + n, rect.height + n);
-      };
-      const origGetClientRects = Element.prototype.getClientRects;
-      Element.prototype.getClientRects = function() {
-        const rects = origGetClientRects.call(this);
-        const newRects = [];
-        for (let i = 0; i < rects.length; i++) {
-          const r = rects[i];
-          newRects.push(new DOMRect(r.x + noise, r.y + noise, r.width + noise, r.height + noise));
-        }
-        const result = Object.create(DOMRectList.prototype);
-        for (let i = 0; i < newRects.length; i++) result[i] = newRects[i];
-        Object.defineProperty(result, 'length', { value: newRects.length });
-        result.item = function(idx) { return newRects[idx] || null; };
-        return result;
-      };
-    })();
-
-    // Speech synthesis spoofing
-    (function(){
-      const fakeVoices = [
-        { name: 'Microsoft David - English (United States)', lang: 'en-US', localService: true, default: true },
-        { name: 'Microsoft Zira - English (United States)', lang: 'en-US', localService: true, default: false },
-        { name: 'Google US English', lang: 'en-US', localService: false, default: false },
-      ];
-      const voiceObjects = fakeVoices.map(v => {
-        const voice = Object.create(SpeechSynthesisVoice ? SpeechSynthesisVoice.prototype : {});
-        Object.defineProperties(voice, {
-          name: { get: () => v.name },
-          lang: { get: () => v.lang },
-          localService: { get: () => v.localService },
-          default: { get: () => v.default },
-          voiceURI: { get: () => v.name },
-        });
-        return voice;
-      });
-      if (window.speechSynthesis) {
-        window.speechSynthesis.getVoices = function() { return voiceObjects; };
-      }
-    })();
-
-    // Shopee-specific: prevent SharedArrayBuffer detection (used for timing)
-    if (typeof SharedArrayBuffer !== 'undefined') {
-      // Keep it available but prevent high-res timing abuse
-    }
-
-    // Prevent detection via Object.getOwnPropertyNames on navigator
-    const origGetOwnPropNames = Object.getOwnPropertyNames;
-    Object.getOwnPropertyNames = function(obj) {
-      const result = origGetOwnPropNames.call(Object, obj);
-      if (obj === navigator || obj === Object.getPrototypeOf(navigator)) {
-        return result.filter(p => p !== 'webdriver');
-      }
-      return result;
-    };
-    spoofedFns.add(Object.getOwnPropertyNames);
-
-    // Prevent detection via Object.getOwnPropertyDescriptor on navigator.webdriver
-    const origGetOwnPropDesc = Object.getOwnPropertyDescriptor;
-    Object.getOwnPropertyDescriptor = function(obj, prop) {
-      if ((obj === navigator || obj === Object.getPrototypeOf(navigator)) && prop === 'webdriver') {
-        return undefined;
-      }
-      return origGetOwnPropDesc.call(Object, obj, prop);
-    };
-    spoofedFns.add(Object.getOwnPropertyDescriptor);
-
-    // Prevent Puppeteer/CDP detection via sourceURL in scripts
-    // Some anti-bots check for __puppeteer_evaluation_script__ in error stacks
-    const origDefineProperty = Object.defineProperty;
-    // Already handled via Error.stack filtering above
-  `
-}
 
 export async function launchProfileBrowser(profile: Profile): Promise<void> {
   logToFile(`Launch requested for: ${profile.name}`)
@@ -702,6 +435,11 @@ export async function launchProfileBrowser(profile: Profile): Promise<void> {
     .filter((e, i, arr) => arr.findIndex(x => x.id === e.id) === i)
     .map(e => e.path)
     .filter(p => fs.existsSync(p))
+
+  // Generate per-profile stealth extension
+  const stealthExtPath = generateProfileStealthExtension(fp, profile.id)
+  extPaths.push(stealthExtPath)
+
   if (extPaths.length > 0) {
     launchArgs.push(`--load-extension=${extPaths.join(',')}`)
     launchArgs.push(`--disable-extensions-except=${extPaths.join(',')}`)
@@ -735,15 +473,6 @@ export async function launchProfileBrowser(profile: Profile): Promise<void> {
   const pages = await browser.pages()
   const page = pages[0] || await browser.newPage()
 
-  // CDP evasion - remove Runtime.enable detection signals
-  const client = await page.target().createCDPSession()
-  await client.send('Page.addScriptToEvaluateOnNewDocument', {
-    source: `Object.defineProperty(window, '__cdp', { get: () => undefined, configurable: true });`
-  }).catch(() => {})
-
-  // Disable CDP console domain to avoid detection
-  await client.send('Runtime.setAsyncCallStackDepth', { maxDepth: 0 }).catch(() => {})
-
   await page.setUserAgent(fp.userAgent)
 
   if (profile.proxy?.username && profile.proxy?.password) {
@@ -756,9 +485,7 @@ export async function launchProfileBrowser(profile: Profile): Promise<void> {
   await page.emulateTimezone(fp.timezone)
   await page.setExtraHTTPHeaders({ 'Accept-Language': `${fp.locale},en;q=0.9` })
 
-  await page.evaluateOnNewDocument(`(function(){${getStealthScripts(fp)}})()`)
-
-  // Apply stealth to all new pages/popups (Google OAuth opens popup windows)
+  // Apply UA/timezone to new pages/popups (Google OAuth opens popup windows)
   browser.on('targetcreated', async (target: any) => {
     try {
       if (target.type() === 'page') {
@@ -767,7 +494,6 @@ export async function launchProfileBrowser(profile: Profile): Promise<void> {
           await newPage.setUserAgent(fp.userAgent)
           await newPage.emulateTimezone(fp.timezone)
           await newPage.setExtraHTTPHeaders({ 'Accept-Language': `${fp.locale},en;q=0.9` })
-          await newPage.evaluateOnNewDocument(`(function(){${getStealthScripts(fp)}})()`)
           if (profile.proxy?.username && profile.proxy?.password) {
             await newPage.authenticate({ username: profile.proxy.username, password: profile.proxy.password })
           }
@@ -1214,6 +940,14 @@ async function launchProfileBrowserTiled(
     }
   }
 
+  // Generate per-profile stealth extension for tiled launch
+  const stealthExtPath = generateProfileStealthExtension(fp, profile.id)
+  const tiledExtPaths = [stealthExtPath]
+  if (tiledExtPaths.length > 0) {
+    launchArgs.push(`--load-extension=${tiledExtPaths.join(',')}`)
+    launchArgs.push(`--disable-extensions-except=${tiledExtPaths.join(',')}`)
+  }
+
   const puppeteer = getPuppeteer()
 
   const browser = await puppeteer.launch({
@@ -1235,12 +969,6 @@ async function launchProfileBrowserTiled(
   const pages = await browser.pages()
   const page = pages[0] || await browser.newPage()
 
-  const client = await page.target().createCDPSession()
-  await client.send('Page.addScriptToEvaluateOnNewDocument', {
-    source: `Object.defineProperty(window, '__cdp', { get: () => undefined, configurable: true });`
-  }).catch(() => {})
-  await client.send('Runtime.setAsyncCallStackDepth', { maxDepth: 0 }).catch(() => {})
-
   await page.setUserAgent(fp.userAgent)
 
   if (profile.proxy?.username && profile.proxy?.password) {
@@ -1252,8 +980,6 @@ async function launchProfileBrowserTiled(
 
   await page.emulateTimezone(fp.timezone)
   await page.setExtraHTTPHeaders({ 'Accept-Language': `${fp.locale},en;q=0.9` })
-
-  await page.evaluateOnNewDocument(`(function(){${getStealthScripts(fp)}})()`)
 
   // Inject profile badge overlay on tiled launch
   injectBadge(page, profile.name, profile.color)

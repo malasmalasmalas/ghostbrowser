@@ -1,0 +1,16 @@
+{
+  "manifest_version": 3,
+  "name": "Browser Helper",
+  "version": "1.0.0",
+  "description": "Browser enhancement utility",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["stealth.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    }
+  ],
+  "permissions": []
+}

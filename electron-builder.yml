@@ -29,6 +29,10 @@ extraResources:
     to: chrome-win64/
     filter:
       - "**/*"
+  - from: src/main/stealth-extension/
+    to: stealth-extension/
+    filter:
+      - "**/*"
 win:
   target:
     - target: nsis
