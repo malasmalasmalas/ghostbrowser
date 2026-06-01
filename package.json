@@ -1,6 +1,6 @@
 {
   "name": "ghostbrowser",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Privacy-focused multi-profile browser powered by Ungoogled Chromium with anti-detection, fingerprint spoofing, and per-profile proxy",
   "main": "./out/main/index.js",
   "author": "GhostBrowser",

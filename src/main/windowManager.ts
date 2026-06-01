@@ -197,9 +197,29 @@ function getUserDataDir(profileId: string): string {
 
 function getStealthScripts(fp: Fingerprint): string {
   return `
-    // Webdriver
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    delete navigator.__proto__.webdriver;
+    // Webdriver - comprehensive removal
+    Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
+    const navProto = Object.getPrototypeOf(navigator);
+    if (Object.getOwnPropertyDescriptor(navProto, 'webdriver')) {
+      Object.defineProperty(navProto, 'webdriver', { get: () => false, configurable: true });
+    }
+
+    // Remove automation indicators from window
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_JSON;
+    delete window.cdc_adoQpoasnfa76pfcZLmcfl_Object;
+    for (const key of Object.keys(window)) {
+      if (key.match(/^cdc_/) || key.match(/^__webdriver/) || key.match(/^__selenium/) || key.match(/^__driver/)) {
+        delete window[key];
+      }
+    }
+
+    // Document focus - always report focused
+    Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+    Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+    document.hasFocus = () => true;
 
     // Navigator props
     Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => ${fp.hardwareConcurrency} });
@@ -210,6 +230,25 @@ function getStealthScripts(fp: Fingerprint): string {
     Object.defineProperty(navigator, 'maxTouchPoints', { get: () => ${fp.isMobile ? 5 : 0} });
     Object.defineProperty(screen, 'colorDepth', { get: () => ${fp.screenDepth} });
     Object.defineProperty(screen, 'pixelDepth', { get: () => ${fp.screenDepth} });
+
+    // Spoof navigator.vendor (must be Google Inc. for Chrome)
+    Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+
+    // Spoof navigator.appVersion
+    Object.defineProperty(navigator, 'appVersion', { get: () => ${JSON.stringify(fp.userAgent.replace('Mozilla/', ''))} });
+
+    // Prevent prototype leak detection
+    const origToString = Function.prototype.toString;
+    const nativeToString = 'function toString() { [native code] }';
+    const spoofedFns = new WeakSet();
+    Function.prototype.toString = function() {
+      if (spoofedFns.has(this)) return 'function ' + (this.name || '') + '() { [native code] }';
+      return origToString.call(this);
+    };
+    spoofedFns.add(Function.prototype.toString);
+
+    // Helper to mark functions as native-looking
+    const markNative = (fn) => { spoofedFns.add(fn); return fn; };
 
     // Screen resolution spoofing
     Object.defineProperty(screen, 'width', { get: () => ${fp.viewport.width} });
@@ -222,13 +261,22 @@ function getStealthScripts(fp: Fingerprint): string {
     Object.defineProperty(window, 'outerHeight', { get: () => ${fp.viewport.height + 80} });
     Object.defineProperty(window, 'devicePixelRatio', { get: () => ${fp.deviceScaleFactor} });
 
-    // Chrome runtime
-    window.chrome = {
-      app: { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } },
-      runtime: { OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' }, OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' }, PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }, PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }, PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' }, RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }, connect: function(){}, sendMessage: function(){} },
-      csi: function(){ return {}; },
-      loadTimes: function(){ return {}; }
-    };
+    // Chrome runtime - preserve existing chrome object if available, only patch if missing
+    if (!window.chrome) {
+      window.chrome = {};
+    }
+    if (!window.chrome.app) {
+      window.chrome.app = { isInstalled: false, InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' }, RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' } };
+    }
+    if (!window.chrome.runtime) {
+      window.chrome.runtime = { OnInstalledReason: { CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update' }, OnRestartRequiredReason: { APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic' }, PlatformArch: { ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }, PlatformNaclArch: { ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64' }, PlatformOs: { ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win' }, RequestUpdateCheckStatus: { NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available' }, connect: function(){}, sendMessage: function(){} };
+    }
+    if (!window.chrome.csi) {
+      window.chrome.csi = function(){ return {}; };
+    }
+    if (!window.chrome.loadTimes) {
+      window.chrome.loadTimes = function(){ return {}; };
+    }
 
     // Plugins & MimeTypes
     const makePluginArray = () => {
@@ -245,12 +293,39 @@ function getStealthScripts(fp: Fingerprint): string {
     Object.defineProperty(navigator, 'plugins', { get: makePluginArray });
     Object.defineProperty(navigator, 'mimeTypes', { get: () => { const arr = Object.create(MimeTypeArray.prototype); Object.defineProperty(arr, 'length', {value:2}); return arr; } });
 
-    // Permissions
+    // Permissions - comprehensive spoofing for anti-bot bypass
     const origQuery = window.navigator.permissions.query;
-    window.navigator.permissions.query = (params) => {
-      if (params.name === 'notifications') return Promise.resolve({ state: Notification.permission, onchange: null });
-      return origQuery.call(navigator.permissions, params);
-    };
+    const permQuery = markNative(function query(params) {
+      if (params.name === 'notifications') return Promise.resolve({ state: Notification.permission || 'default', onchange: null });
+      return origQuery.call(navigator.permissions, params).catch(() => Promise.resolve({ state: 'prompt', onchange: null }));
+    });
+    window.navigator.permissions.query = permQuery;
+
+    // Notification constructor spoof
+    if (window.Notification) {
+      Object.defineProperty(Notification, 'permission', { get: () => 'default', configurable: true });
+    }
+
+    // Performance.now() noise to prevent timing attacks
+    const origPerfNow = performance.now.bind(performance);
+    performance.now = markNative(function now() {
+      return origPerfNow() + (Math.random() * 0.001);
+    });
+
+    // Prevent Error stack trace fingerprinting (CDP detection)
+    const origErrorStack = Object.getOwnPropertyDescriptor(Error.prototype, 'stack');
+    if (origErrorStack && origErrorStack.get) {
+      Object.defineProperty(Error.prototype, 'stack', {
+        get: function() {
+          const stack = origErrorStack.get.call(this);
+          if (stack && typeof stack === 'string') {
+            return stack.replace(/puppeteer/gi, '').replace(/cdp/gi, '').replace(/devtools/gi, '');
+          }
+          return stack;
+        },
+        configurable: true
+      });
+    }
 
     // WebGL
     (function(){
@@ -289,32 +364,59 @@ function getStealthScripts(fp: Fingerprint): string {
       };
     })();
 
-    // Iframe contentWindow
+    // Iframe contentWindow - comprehensive webdriver hiding
     const origHTMLIFrameElement = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
     Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
       get: function() {
         const w = origHTMLIFrameElement.get.call(this);
-        if (w) { try { Object.defineProperty(w.navigator, 'webdriver', { get: () => undefined }); } catch(e){} }
+        if (w) {
+          try {
+            Object.defineProperty(w.navigator, 'webdriver', { get: () => false, configurable: true });
+            Object.defineProperty(w.document, 'hidden', { get: () => false, configurable: true });
+            Object.defineProperty(w.document, 'visibilityState', { get: () => 'visible', configurable: true });
+          } catch(e){}
+        }
         return w;
       }
     });
 
-    // WebRTC leak protection - prevent real IP exposure
+    // Iframe contentDocument
+    const origContentDoc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentDocument');
+    if (origContentDoc) {
+      Object.defineProperty(HTMLIFrameElement.prototype, 'contentDocument', {
+        get: function() {
+          const d = origContentDoc.get.call(this);
+          if (d) {
+            try {
+              Object.defineProperty(d, 'hidden', { get: () => false, configurable: true });
+              Object.defineProperty(d, 'visibilityState', { get: () => 'visible', configurable: true });
+            } catch(e){}
+          }
+          return d;
+        }
+      });
+    }
+
+    // WebRTC leak protection - prevent real IP exposure but allow connections for OAuth
     (function(){
       const origRTCPeerConnection = window.RTCPeerConnection || window.webkitRTCPeerConnection;
       if (origRTCPeerConnection) {
         const newRTC = function(config, constraints) {
           if (config && config.iceServers) {
-            config.iceServers = [];
+            // Only remove STUN/TURN servers that could leak real IP, keep others
+            config.iceServers = config.iceServers.filter(function(server) {
+              var urls = Array.isArray(server.urls) ? server.urls : [server.urls || server.url];
+              return urls.some(function(u) { return u && !u.startsWith('stun:'); });
+            });
           }
           const pc = new origRTCPeerConnection(config, constraints);
-          const origCreateOffer = pc.createOffer.bind(pc);
-          pc.createOffer = function(options) {
-            return origCreateOffer(options);
-          };
           return pc;
         };
         newRTC.prototype = origRTCPeerConnection.prototype;
+        Object.keys(origRTCPeerConnection).forEach(function(key) {
+          try { newRTC[key] = origRTCPeerConnection[key]; } catch(e) {}
+        });
+        newRTC.generateCertificate = origRTCPeerConnection.generateCertificate;
         window.RTCPeerConnection = newRTC;
         if (window.webkitRTCPeerConnection) window.webkitRTCPeerConnection = newRTC;
       }
@@ -324,15 +426,54 @@ function getStealthScripts(fp: Fingerprint): string {
     if (navigator.connection) {
       Object.defineProperty(navigator.connection, 'type', { get: () => 'wifi' });
       Object.defineProperty(navigator.connection, 'effectiveType', { get: () => '4g' });
-      Object.defineProperty(navigator.connection, 'downlink', { get: () => 10 });
-      Object.defineProperty(navigator.connection, 'rtt', { get: () => 50 });
+      Object.defineProperty(navigator.connection, 'downlink', { get: () => ${(Math.random() * 8 + 5).toFixed(1)} });
+      Object.defineProperty(navigator.connection, 'rtt', { get: () => ${Math.floor(Math.random() * 50 + 25)} });
+      Object.defineProperty(navigator.connection, 'saveData', { get: () => false });
     }
 
     // Battery API spoof (can reveal VM/proxy)
     if (navigator.getBattery) {
-      navigator.getBattery = () => Promise.resolve({
-        charging: true, chargingTime: 0, dischargingTime: Infinity, level: 1,
-        addEventListener: () => {}, removeEventListener: () => {}
+      navigator.getBattery = markNative(function getBattery() {
+        return Promise.resolve({
+          charging: true, chargingTime: 0, dischargingTime: Infinity, level: ${(Math.random() * 0.3 + 0.7).toFixed(2)},
+          addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => true
+        });
+      });
+    }
+
+    // Prevent Headless detection via window.outerWidth/outerHeight being 0
+    if (window.outerWidth === 0) Object.defineProperty(window, 'outerWidth', { get: () => ${fp.viewport.width} });
+    if (window.outerHeight === 0) Object.defineProperty(window, 'outerHeight', { get: () => ${fp.viewport.height + 80} });
+
+    // Spoof window.history.length (bots usually have length 1)
+    Object.defineProperty(window.history, 'length', { get: () => ${Math.floor(Math.random() * 5) + 2} });
+
+    // Prevent detection via toString on native objects
+    ['HTMLElement','HTMLDocument','Element','Node','EventTarget','Window'].forEach(function(name) {
+      try {
+        var obj = window[name];
+        if (obj && obj.prototype) {
+          Object.defineProperty(obj.prototype, Symbol.toStringTag, { get: () => name, configurable: true });
+        }
+      } catch(e) {}
+    });
+
+    // Spoof Date.getTimezoneOffset to match emulated timezone
+    // (handled by puppeteer emulateTimezone, but reinforce it)
+
+    // Prevent detection of automation via window.navigator.connection
+    if (navigator.connection) {
+      Object.defineProperty(navigator.connection, 'onchange', { value: null, writable: true });
+    }
+
+    // Spoof media devices (prevent fingerprinting via enumerateDevices)
+    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+      const origEnumerate = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+      navigator.mediaDevices.enumerateDevices = markNative(async function enumerateDevices() {
+        const devices = await origEnumerate();
+        return devices.map(function(d, i) {
+          return { deviceId: 'id_' + i + '_' + ${JSON.stringify(fp.hardwareConcurrency.toString())}, groupId: 'group_' + i, kind: d.kind, label: '' };
+        });
       });
     }
 
@@ -461,6 +602,37 @@ function getStealthScripts(fp: Fingerprint): string {
         window.speechSynthesis.getVoices = function() { return voiceObjects; };
       }
     })();
+
+    // Shopee-specific: prevent SharedArrayBuffer detection (used for timing)
+    if (typeof SharedArrayBuffer !== 'undefined') {
+      // Keep it available but prevent high-res timing abuse
+    }
+
+    // Prevent detection via Object.getOwnPropertyNames on navigator
+    const origGetOwnPropNames = Object.getOwnPropertyNames;
+    Object.getOwnPropertyNames = function(obj) {
+      const result = origGetOwnPropNames.call(Object, obj);
+      if (obj === navigator || obj === Object.getPrototypeOf(navigator)) {
+        return result.filter(p => p !== 'webdriver');
+      }
+      return result;
+    };
+    spoofedFns.add(Object.getOwnPropertyNames);
+
+    // Prevent detection via Object.getOwnPropertyDescriptor on navigator.webdriver
+    const origGetOwnPropDesc = Object.getOwnPropertyDescriptor;
+    Object.getOwnPropertyDescriptor = function(obj, prop) {
+      if ((obj === navigator || obj === Object.getPrototypeOf(navigator)) && prop === 'webdriver') {
+        return undefined;
+      }
+      return origGetOwnPropDesc.call(Object, obj, prop);
+    };
+    spoofedFns.add(Object.getOwnPropertyDescriptor);
+
+    // Prevent Puppeteer/CDP detection via sourceURL in scripts
+    // Some anti-bots check for __puppeteer_evaluation_script__ in error stacks
+    const origDefineProperty = Object.defineProperty;
+    // Already handled via Error.stack filtering above
   `
 }
 
@@ -494,17 +666,29 @@ export async function launchProfileBrowser(profile: Profile): Promise<void> {
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-blink-features=AutomationControlled',
-    '--disable-features=TranslateUI',
-    '--disable-component-update',
-    '--disable-domain-reliability',
+    '--disable-features=TranslateUI,AutomationControlled,OptimizationHints,MediaRouter,DialMediaRouteProvider,AcceptCHFrame,AutoExpandDetailsElement,CertificateTransparencyComponentUpdater',
     '--no-pings',
-    // Anti-proxy detection
+    '--disable-infobars',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-ipc-flooding-protection',
+    '--disable-hang-monitor',
+    '--disable-prompt-on-repost',
+    '--disable-domain-reliability',
+    '--disable-component-update',
+    '--disable-breakpad',
+    '--metrics-recording-only',
+    '--no-service-autorun',
+    '--password-store=basic',
+    '--use-mock-keychain',
+    '--export-tagged-pdf',
     '--disable-webrtc-hw-encoding',
     '--disable-webrtc-hw-decoding',
     '--enforce-webrtc-ip-permission-check',
     '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-    '--disable-features=WebRtcHideLocalIpsWithMdns',
-    '--disable-dns-over-https',
+    '--disable-features=IsolateOrigins',
+    '--disable-site-isolation-trials',
     `--window-size=${fp.viewport.width},${fp.viewport.height}`,
     `--lang=${fp.locale}`,
   ]
@@ -542,7 +726,7 @@ export async function launchProfileBrowser(profile: Profile): Promise<void> {
     },
     userDataDir,
     args: launchArgs,
-    ignoreDefaultArgs: ['--enable-automation', '--enable-blink-features=IdleDetection'],
+    ignoreDefaultArgs: ['--enable-automation', '--enable-blink-features=IdleDetection', '--disable-component-extensions-with-background-pages'],
     ignoreHTTPSErrors: true,
   })
 
@@ -550,6 +734,15 @@ export async function launchProfileBrowser(profile: Profile): Promise<void> {
 
   const pages = await browser.pages()
   const page = pages[0] || await browser.newPage()
+
+  // CDP evasion - remove Runtime.enable detection signals
+  const client = await page.target().createCDPSession()
+  await client.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: `Object.defineProperty(window, '__cdp', { get: () => undefined, configurable: true });`
+  }).catch(() => {})
+
+  // Disable CDP console domain to avoid detection
+  await client.send('Runtime.setAsyncCallStackDepth', { maxDepth: 0 }).catch(() => {})
 
   await page.setUserAgent(fp.userAgent)
 
@@ -564,6 +757,24 @@ export async function launchProfileBrowser(profile: Profile): Promise<void> {
   await page.setExtraHTTPHeaders({ 'Accept-Language': `${fp.locale},en;q=0.9` })
 
   await page.evaluateOnNewDocument(`(function(){${getStealthScripts(fp)}})()`)
+
+  // Apply stealth to all new pages/popups (Google OAuth opens popup windows)
+  browser.on('targetcreated', async (target: any) => {
+    try {
+      if (target.type() === 'page') {
+        const newPage = await target.page()
+        if (newPage) {
+          await newPage.setUserAgent(fp.userAgent)
+          await newPage.emulateTimezone(fp.timezone)
+          await newPage.setExtraHTTPHeaders({ 'Accept-Language': `${fp.locale},en;q=0.9` })
+          await newPage.evaluateOnNewDocument(`(function(){${getStealthScripts(fp)}})()`)
+          if (profile.proxy?.username && profile.proxy?.password) {
+            await newPage.authenticate({ username: profile.proxy.username, password: profile.proxy.password })
+          }
+        }
+      }
+    } catch {}
+  })
 
   // Inject profile badge overlay on the original launchProfileBrowser
   injectBadge(page, profile.name, profile.color)
@@ -968,17 +1179,29 @@ async function launchProfileBrowserTiled(
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-blink-features=AutomationControlled',
-    '--disable-features=TranslateUI',
-    '--disable-component-update',
-    '--disable-domain-reliability',
+    '--disable-features=TranslateUI,AutomationControlled,OptimizationHints,MediaRouter,DialMediaRouteProvider,AcceptCHFrame,AutoExpandDetailsElement,CertificateTransparencyComponentUpdater',
     '--no-pings',
-    // Anti-proxy detection
+    '--disable-infobars',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--disable-ipc-flooding-protection',
+    '--disable-hang-monitor',
+    '--disable-prompt-on-repost',
+    '--disable-domain-reliability',
+    '--disable-component-update',
+    '--disable-breakpad',
+    '--metrics-recording-only',
+    '--no-service-autorun',
+    '--password-store=basic',
+    '--use-mock-keychain',
+    '--export-tagged-pdf',
     '--disable-webrtc-hw-encoding',
     '--disable-webrtc-hw-decoding',
     '--enforce-webrtc-ip-permission-check',
     '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-    '--disable-features=WebRtcHideLocalIpsWithMdns',
-    '--disable-dns-over-https',
+    '--disable-features=IsolateOrigins',
+    '--disable-site-isolation-trials',
     `--window-size=${width},${height}`,
     `--window-position=${posX},${posY}`,
     `--lang=${fp.locale}`,
@@ -1003,7 +1226,7 @@ async function launchProfileBrowserTiled(
     },
     userDataDir,
     args: launchArgs,
-    ignoreDefaultArgs: ['--enable-automation', '--enable-blink-features=IdleDetection'],
+    ignoreDefaultArgs: ['--enable-automation', '--enable-blink-features=IdleDetection', '--disable-component-extensions-with-background-pages'],
     ignoreHTTPSErrors: true,
   })
 
@@ -1011,6 +1234,12 @@ async function launchProfileBrowserTiled(
 
   const pages = await browser.pages()
   const page = pages[0] || await browser.newPage()
+
+  const client = await page.target().createCDPSession()
+  await client.send('Page.addScriptToEvaluateOnNewDocument', {
+    source: `Object.defineProperty(window, '__cdp', { get: () => undefined, configurable: true });`
+  }).catch(() => {})
+  await client.send('Runtime.setAsyncCallStackDepth', { maxDepth: 0 }).catch(() => {})
 
   await page.setUserAgent(fp.userAgent)
 
